@@ -1,0 +1,369 @@
+#include <SDL.h>
+#include <vector>
+#include <iostream>
+#include <string>
+#include <random>
+#include <ctime>
+#include <algorithm> // Pt std::max, std::min
+
+// --- CONSTANTE JOC ---
+const int WINDOW_WIDTH = 1280;
+const int WINDOW_HEIGHT = 720;
+const int MAX_ENTITIES = 10000;
+
+// --- CONSTANTE GRID ---
+const int CELL_SIZE = 64; // Celula de 64x64 pixeli
+const int GRID_COLS = (WINDOW_WIDTH / CELL_SIZE) + 1;
+const int GRID_ROWS = (WINDOW_HEIGHT / CELL_SIZE) + 1;
+const int MAX_CELLS = GRID_COLS * GRID_ROWS;
+
+// --- UTILITARE ---
+float randomFloat(float min, float max) {
+    return min + static_cast <float> (rand()) / (static_cast <float> (RAND_MAX / (max - min)));
+}
+
+// ==========================================
+// 1. COMPONENTE
+// ==========================================
+struct TransformComponent { float x, y; };
+struct VelocityComponent { float vx, vy; };
+struct SpriteComponent { bool isVisible; Uint8 r, g, b; int w, h; };
+enum EntityType { TYPE_NONE, TYPE_PLAYER, TYPE_ENEMY, TYPE_COIN };
+struct ColliderComponent { bool isActive; float radius; EntityType type; };
+
+// ==========================================
+// 2. REGISTRY
+// ==========================================
+class Registry {
+public:
+    std::vector<TransformComponent> transforms;
+    std::vector<VelocityComponent> velocities;
+    std::vector<SpriteComponent> sprites;
+    std::vector<ColliderComponent> colliders;
+
+    // --- ELEMENTUL CHEIE PENTRU GRID ---
+    // Aceasta componenta tine minte "cine e urmatorul in celula cu mine"
+    std::vector<int> nextEntity;
+
+    int entityCount = 0;
+
+    void init(int maxEntities) {
+        transforms.resize(maxEntities);
+        velocities.resize(maxEntities);
+        sprites.resize(maxEntities);
+        colliders.resize(maxEntities);
+        nextEntity.resize(maxEntities); // Alocare o singura data
+        entityCount = 0;
+    }
+
+    int createEntity() {
+        if (entityCount >= transforms.size()) return -1;
+        int id = entityCount++;
+        colliders[id].isActive = false;
+        sprites[id].isVisible = true;
+        velocities[id] = { 0, 0 };
+        nextEntity[id] = -1; // Resetam link-ul
+        return id;
+    }
+
+    void destroyEntity(int id) {
+        sprites[id].isVisible = false;
+        colliders[id].isActive = false;
+        transforms[id].x = -10000; // Il mutam departe
+    }
+};
+
+// ==========================================
+// 3. SISTEME
+// ==========================================
+
+class InputSystem {
+public:
+    void update(Registry& reg, const Uint8* keys, int playerID) {
+        float speed = 350.0f; // Viteza jucator
+        reg.velocities[playerID].vx = 0;
+        reg.velocities[playerID].vy = 0;
+
+        if (keys[SDL_SCANCODE_W] || keys[SDL_SCANCODE_UP])    reg.velocities[playerID].vy = -speed;
+        if (keys[SDL_SCANCODE_S] || keys[SDL_SCANCODE_DOWN])  reg.velocities[playerID].vy = speed;
+        if (keys[SDL_SCANCODE_A] || keys[SDL_SCANCODE_LEFT])  reg.velocities[playerID].vx = -speed;
+        if (keys[SDL_SCANCODE_D] || keys[SDL_SCANCODE_RIGHT]) reg.velocities[playerID].vx = speed;
+    }
+};
+
+class PhysicsSystem {
+public:
+    void update(Registry& reg, float dt) {
+        for (int i = 0; i < reg.entityCount; i++) {
+            if (!reg.sprites[i].isVisible) continue;
+
+            // JIGGLE ---
+            // Banutii tremura pe loc. Asta forteaza procesorul sa scrie in memorie
+            // la pozitii aleatoare, prevenind optimizari statice prea agresive.
+            if (reg.colliders[i].type == TYPE_COIN) {
+                reg.transforms[i].x += randomFloat(-1.5f, 1.5f);
+                reg.transforms[i].y += randomFloat(-1.5f, 1.5f);
+            }
+
+            // Miscare normala
+            reg.transforms[i].x += reg.velocities[i].vx * dt;
+            reg.transforms[i].y += reg.velocities[i].vy * dt;
+
+            // Bounce la inamici
+            if (reg.velocities[i].vx != 0 || reg.velocities[i].vy != 0) {
+                if (reg.transforms[i].x <= 0 || reg.transforms[i].x >= WINDOW_WIDTH - reg.sprites[i].w) reg.velocities[i].vx *= -1;
+                if (reg.transforms[i].y <= 0 || reg.transforms[i].y >= WINDOW_HEIGHT - reg.sprites[i].h) reg.velocities[i].vy *= -1;
+            }
+        }
+    }
+};
+
+// --- AICI ESTE GRID-UL SMART ---
+// --- IMPLEMENTAREA SMART GRID + COIN PHYSICS ---
+class GameplaySystem {
+private:
+    int gridHead[MAX_CELLS];
+
+public:
+    int score = 0;
+    bool gameOver = false;
+
+    void update(Registry& reg, int playerID) {
+        if (gameOver) return;
+
+        // 1. CLEAR GRID
+        std::fill(std::begin(gridHead), std::end(gridHead), -1);
+
+        // 2. POPULATE GRID
+        for (int i = 0; i < reg.entityCount; i++) {
+            if (!reg.colliders[i].isActive) continue;
+            // Nota: Acum punem si Jucatorul in Grid, ca sa il impingem si pe el daca e cazul
+            // Dar pentru simplitate, il lasam pe el "fantoma" fata de coins, si coins intre ele solide.
+            if (i == playerID) continue;
+
+            int cx = (int)(reg.transforms[i].x / CELL_SIZE);
+            int cy = (int)(reg.transforms[i].y / CELL_SIZE);
+
+            if (cx >= 0 && cx < GRID_COLS && cy >= 0 && cy < GRID_ROWS) {
+                int cellIndex = cy * GRID_COLS + cx;
+                reg.nextEntity[i] = gridHead[cellIndex];
+                gridHead[cellIndex] = i;
+            }
+        }
+
+        // --- NOU: REZOLVARE COLIZIUNI INTRE MONEDE (Physics Separation) ---
+        // Trecem prin fiecare celula a grilei
+        for (int c = 0; c < MAX_CELLS; c++) {
+            int i = gridHead[c]; // Primul din celula
+
+            // Cat timp mai sunt entitati in celula
+            while (i != -1) {
+                // Verificam entitatea 'i' cu toate celelalte care urmeaza dupa ea in lista ('j')
+                // Asta evita dubla verificare (A vs B si B vs A)
+                int j = reg.nextEntity[i];
+
+                while (j != -1) {
+                    // Verificam coliziune i vs j
+                    // (Facem doar Coin vs Coin pentru demo, dar merge orice)
+                    if (reg.colliders[i].type == TYPE_COIN && reg.colliders[j].type == TYPE_COIN) {
+
+                        float dx = reg.transforms[i].x - reg.transforms[j].x;
+                        float dy = reg.transforms[i].y - reg.transforms[j].y;
+
+                        // Optimizare: Manhattan distance check rapid
+                        if (abs(dx) < 20 && abs(dy) < 20) {
+                            float distSq = dx * dx + dy * dy;
+                            float rTotal = reg.colliders[i].radius + reg.colliders[j].radius; // Raza combinata
+
+                            // Daca se suprapun
+                            if (distSq < rTotal * rTotal && distSq > 0.0001f) {
+                                float dist = sqrt(distSq);
+                                float overlap = rTotal - dist; // Cat de mult au intrat una in alta
+
+                                // Le impingem in directii opuse
+                                float nx = dx / dist; // Directia normalizata
+                                float ny = dy / dist;
+
+                                float separationForce = overlap * 0.5f; // Fiecare se duce jumate din drum
+
+                                reg.transforms[i].x += nx * separationForce;
+                                reg.transforms[i].y += ny * separationForce;
+                                reg.transforms[j].x -= nx * separationForce;
+                                reg.transforms[j].y -= ny * separationForce;
+                            }
+                        }
+                    }
+                    j = reg.nextEntity[j]; // Urmatorul vecin
+                }
+                i = reg.nextEntity[i]; // Urmatoarea entitate principala
+            }
+        }
+
+        // 3. CHECK PLAYER COLLISION
+        float px = reg.transforms[playerID].x;
+        float py = reg.transforms[playerID].y;
+        float pr = reg.colliders[playerID].radius;
+
+        int pcx = (int)(px / CELL_SIZE);
+        int pcy = (int)(py / CELL_SIZE);
+
+        for (int x = std::max(0, pcx - 1); x <= std::min(GRID_COLS - 1, pcx + 1); x++) {
+            for (int y = std::max(0, pcy - 1); y <= std::min(GRID_ROWS - 1, pcy + 1); y++) {
+
+                int cellIndex = y * GRID_COLS + x;
+                int currentEntityID = gridHead[cellIndex];
+
+                while (currentEntityID != -1) {
+                    float dx = px - reg.transforms[currentEntityID].x;
+                    float dy = py - reg.transforms[currentEntityID].y;
+
+                    if (abs(dx) < 40 && abs(dy) < 40) {
+                        float distSq = dx * dx + dy * dy;
+                        float rTotal = pr + reg.colliders[currentEntityID].radius;
+
+                        if (distSq < rTotal * rTotal) {
+                            EntityType type = reg.colliders[currentEntityID].type;
+                            if (type == TYPE_COIN) {
+                                score++;
+                                reg.destroyEntity(currentEntityID);
+                            }
+                            else if (type == TYPE_ENEMY) {
+                                gameOver = true;
+                                reg.velocities[playerID] = { 0,0 };
+                                reg.sprites[playerID].r = 100;
+                            }
+                        }
+                    }
+                    currentEntityID = reg.nextEntity[currentEntityID];
+                }
+            }
+        }
+    }
+};
+class RenderSystem {
+public:
+    void render(Registry& reg, SDL_Renderer* renderer) {
+        SDL_SetRenderDrawColor(renderer, 20, 20, 30, 255);
+        SDL_RenderClear(renderer);
+
+        SDL_Rect rect;
+        for (int i = 0; i < reg.entityCount; i++) {
+            if (!reg.sprites[i].isVisible) continue;
+
+            SDL_SetRenderDrawColor(renderer, reg.sprites[i].r, reg.sprites[i].g, reg.sprites[i].b, 255);
+            rect.x = (int)reg.transforms[i].x;
+            rect.y = (int)reg.transforms[i].y;
+            rect.w = reg.sprites[i].w;
+            rect.h = reg.sprites[i].h;
+            SDL_RenderFillRect(renderer, &rect);
+        }
+        SDL_RenderPresent(renderer);
+    }
+};
+
+// ==========================================
+// 4. MAIN ENGINE
+// ==========================================
+class GameEngine {
+private:
+    SDL_Window* window = nullptr;
+    SDL_Renderer* renderer = nullptr;
+    bool isRunning = true;
+    Registry registry;
+    InputSystem inputSystem;
+    PhysicsSystem physicsSystem;
+    RenderSystem renderSystem;
+    GameplaySystem gameplaySystem;
+    int playerID = 0;
+
+public:
+    bool init() {
+        if (SDL_Init(SDL_INIT_VIDEO) < 0) return false;
+        window = SDL_CreateWindow("Smart Grid Gameplay", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, WINDOW_WIDTH, WINDOW_HEIGHT, SDL_WINDOW_SHOWN);
+        renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
+
+        registry.init(MAX_ENTITIES);
+        initLevel();
+        return true;
+    }
+
+    void initLevel() {
+        // Player
+        playerID = registry.createEntity();
+        registry.transforms[playerID] = { WINDOW_WIDTH / 2, WINDOW_HEIGHT / 2 };
+        registry.velocities[playerID] = { 0, 0 };
+        registry.sprites[playerID] = { true, 0, 255, 0, 30, 30 };
+        registry.colliders[playerID] = { true, 15, TYPE_PLAYER };
+
+        // Inamici
+        for (int i = 0; i < 30; i++) { ///probabil ar trebui sa nu mai fie hardcoded
+            int id = registry.createEntity();
+            registry.transforms[id] = { randomFloat(0, WINDOW_WIDTH), randomFloat(0, WINDOW_HEIGHT) };
+            registry.velocities[id] = { randomFloat(-250, 250), randomFloat(-250, 250) };
+            registry.sprites[id] = { true, 255, 50, 50, 25, 25 };
+            registry.colliders[id] = { true, 12, TYPE_ENEMY };
+        }
+
+        // Coins 
+        for (int i = 0; i < 500; i++) { ///probabil ar trebui sa nu mai fie hardcoded
+            int id = registry.createEntity();
+            registry.transforms[id] = { randomFloat(50, WINDOW_WIDTH - 50), randomFloat(50, WINDOW_HEIGHT - 50) };
+            registry.sprites[id] = { true, 255, 215, 0, 15, 15 };
+            registry.colliders[id] = { true, 8, TYPE_COIN };
+        }
+    }
+
+    void run() {
+        SDL_Event ev;
+        Uint64 lastTime = SDL_GetPerformanceCounter();
+
+        while (isRunning) {
+            while (SDL_PollEvent(&ev)) {
+                if (ev.type == SDL_QUIT) isRunning = false;
+                if (ev.type == SDL_KEYDOWN && ev.key.keysym.sym == SDLK_ESCAPE) isRunning = false;
+                // Reset la R
+                if (ev.type == SDL_KEYDOWN && ev.key.keysym.sym == SDLK_r && gameplaySystem.gameOver) {
+                    gameplaySystem.gameOver = false;
+                    gameplaySystem.score = 0;
+                    registry.sprites[playerID].r = 0;
+                    // Simplificare: Nu regeneram nivelul, doar continuam
+                    registry.velocities[playerID] = { 0,0 };
+                }
+            }
+            const Uint8* keys = SDL_GetKeyboardState(NULL);
+
+            Uint64 currentTime = SDL_GetPerformanceCounter();
+            float dt = (float)((currentTime - lastTime) * 1000 / (double)SDL_GetPerformanceFrequency()) / 1000.0f;
+            lastTime = currentTime;
+
+            if (!gameplaySystem.gameOver) {
+                inputSystem.update(registry, keys, playerID);
+                physicsSystem.update(registry, dt);
+                gameplaySystem.update(registry, playerID);
+            }
+
+            renderSystem.render(registry, renderer);
+
+            static Uint32 lastTitle = 0;
+            if (SDL_GetTicks() - lastTitle > 100) {
+                lastTitle = SDL_GetTicks();
+                std::string title = "Entities: " + std::to_string(registry.entityCount) +
+                    " | FPS: " + std::to_string((int)(1.0f / dt)) +
+                    " | Score: " + std::to_string(gameplaySystem.score);
+                SDL_SetWindowTitle(window, title.c_str());
+            }
+        }
+        SDL_DestroyRenderer(renderer);
+        SDL_DestroyWindow(window);
+        SDL_Quit();
+    }
+};
+
+int main(int argc, char* args[]) {
+    srand((unsigned int)time(0));
+    GameEngine game;
+    if (game.init()) {
+        game.run();
+    }
+    return 0;
+}
